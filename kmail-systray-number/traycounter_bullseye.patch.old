@@ -1,0 +1,211 @@
+diff -rup kmail-20.08.3/src/configuredialog/configureappearancepage.cpp kmail-20.08.3-patched/src/configuredialog/configureappearancepage.cpp
+--- kmail-20.08.3/src/configuredialog/configureappearancepage.cpp	2020-10-31 18:35:07.000000000 +0100
++++ kmail-20.08.3-patched/src/configuredialog/configureappearancepage.cpp	2021-12-10 04:34:41.427284828 +0100
+@@ -897,6 +897,14 @@ AppearancePageGeneralTab::AppearancePage
+     connect(mShowNumberInTaskBar, &QCheckBox::stateChanged,
+             this, &ConfigModuleTab::slotEmitChanged);
+ 
++    mSystemTrayShowUnreadMail = new QCheckBox(i18n("Show unread mail in tray icon"), this);
++    systrayBoxlayout->addWidget(mSystemTrayShowUnreadMail);
++    mSystemTrayShowUnreadMail->setEnabled(false);
++    connect(mSystemTrayShowUnreadMail, &QCheckBox::stateChanged,
++            this, &ConfigModuleTab::slotEmitChanged);
++    connect(mSystemTrayCheck, &QAbstractButton::toggled,
++            mSystemTrayShowUnreadMail, &QWidget::setEnabled);
++
+     topLayout->addStretch(100);   // spacer
+ }
+ 
+@@ -908,6 +916,7 @@ void AppearancePage::ReaderTab::doLoadOt
+ {
+     loadWidget(mSystemTrayCheck, KMailSettings::self()->systemTrayEnabledItem());
+     loadWidget(mStartInTrayCheck, KMailSettings::self()->startInTrayItem());
++    loadWidget(mSystemTrayShowUnreadMail, KMailSettings::self()->systemTrayShowUnreadItem());
+     loadWidget(mShowNumberInTaskBar, KMailSettings::self()->showUnreadInTaskbarItem());
+     loadWidget(mCloseAfterReplyOrForwardCheck, MessageViewer::MessageViewerSettings::self()->closeAfterReplyOrForwardItem());
+     mViewerSettings->readConfig();
+@@ -916,6 +925,7 @@ void AppearancePage::ReaderTab::doLoadOt
+ void AppearancePage::ReaderTab::save()
+ {
+     saveCheckBox(mSystemTrayCheck, KMailSettings::self()->systemTrayEnabledItem());
++    saveCheckBox(mSystemTrayShowUnreadMail, KMailSettings::self()->systemTrayShowUnreadItem());
+     saveCheckBox(mStartInTrayCheck, KMailSettings::self()->startInTrayItem());
+     saveCheckBox(mShowNumberInTaskBar, KMailSettings::self()->showUnreadInTaskbarItem());
+     KMailSettings::self()->save();
+Nur in kmail-20.08.3-patched/src/configuredialog: configureappearancepage.cpp.orig.
+diff -rup kmail-20.08.3/src/configuredialog/configureappearancepage.h kmail-20.08.3-patched/src/configuredialog/configureappearancepage.h
+--- kmail-20.08.3/src/configuredialog/configureappearancepage.h	2020-10-31 18:35:07.000000000 +0100
++++ kmail-20.08.3-patched/src/configuredialog/configureappearancepage.h	2021-12-10 04:34:41.427284828 +0100
+@@ -172,6 +172,7 @@ private: // data
+     QCheckBox *mShowNumberInTaskBar = nullptr;
++    QCheckBox *mSystemTrayShowUnreadMail = nullptr;
+ };
+ 
+ class TagListWidgetItem : public QListWidgetItem
+ {
+ public:
+Nur in kmail-20.08.3-patched/src/configuredialog: configureappearancepage.h.orig.
+diff -rup kmail-20.08.3/src/kmsystemtray.cpp kmail-20.08.3-patched/src/kmsystemtray.cpp
+--- kmail-20.08.3/src/kmsystemtray.cpp	2020-10-31 18:35:07.000000000 +0100
++++ kmail-20.08.3-patched/src/kmsystemtray.cpp	2021-12-10 04:34:41.427284828 +0100
+@@ -34,6 +34,8 @@
+ #include <QAction>
+ 
+ #include "widgets/kactionmenutransport.h"
++#include <QPainter>
++#include <KIconLoader>
+ 
+ using namespace MailCommon;
+ 
+@@ -57,6 +59,7 @@ KMSystemTray::KMSystemTray(QObject *pare
+     setToolTipTitle(i18n("KMail"));
+     setToolTipIconByName(QStringLiteral("kmail"));
+     setIconByName(QStringLiteral("kmail"));
++    mIcon=QIcon::fromTheme(QStringLiteral("mail-mark-unread-new"));
+ 
+     KMMainWidget *mainWidget = kmkernel->getKMMainWidget();
+     if (mainWidget) {
+@@ -135,17 +138,78 @@ void KMSystemTray::initialize(int count)
+     updateToolTip(count);
+ }
+ 
++void KMSystemTray::setShowUnreadCount(bool showUnreadCount)
++{
++    if (mShowUnreadMailCount == showUnreadCount) {
++        return;
++    }
++    mShowUnreadMailCount = showUnreadCount;
++    mUnityServiceManager->updateSystemTray();
++}
++
++void KMSystemTray::slotGeneralPaletteChanged()
++{
++    const KColorScheme scheme(QPalette::Active, KColorScheme::View);
++    mTextColor = scheme.foreground(KColorScheme::LinkText).color();
++    mUnityServiceManager->updateSystemTray();
++}
++
++
+ /**
+  * Update the count of unread messages.  If there are unread messages,
+- * show the "unread new mail" KMail icon.
++ * overlay the count on top of a transparent version of the KMail icon.
+  * If there is no unread mail, restore the normal KMail icon.
+  */
+ void KMSystemTray::updateCount(int count)
+ {
+     if (count == 0) {
+         setIconByName(QStringLiteral("kmail"));
++	return;
++    }
++    if (mShowUnreadMailCount) {
++        const int overlaySize = IconSize(KIconLoader::Panel);
++
++        const QString countString = QString::number(count);
++        QFont countFont = QFontDatabase::systemFont(QFontDatabase::GeneralFont);
++        countFont.setBold(true);
++
++	// We now adjust the font size to fit the number inside the
++	// available space. We pick always the same size for numbers up to
++	// 99, and then decrease as needed.
++	// Remark:overlaySize is 32 pixels and the final icon is scaled
++	// down to 22 pixels, so the "natural" font size is meaningless anyway.
++        float countFontSize = countFont.pointSizeF();
++        QFontMetrics qfm(countFont);
++        const int width = qfm.horizontalAdvance(
++			count < 100 ? QStringLiteral("99") : countString);
++        countFontSize *= float(overlaySize - 2) / float(width);
++        countFont.setPointSizeF(countFontSize);
++
++        // Paint the number in a pixmap
++        QPixmap overlayPixmap(overlaySize, overlaySize);
++        overlayPixmap.fill(Qt::transparent);
++
++        QPainter p(&overlayPixmap);
++        p.setFont(countFont);
++        if (!mTextColor.isValid()) {
++            slotGeneralPaletteChanged();
++        }
++
++        p.setBrush(Qt::NoBrush);
++        p.setPen(mTextColor);
++        p.setOpacity(1.0);
++        p.drawText(overlayPixmap.rect(), Qt::AlignCenter, countString);
++        p.end();
++
++        QPixmap iconPixmap = mIcon.pixmap(overlaySize, overlaySize);
++
++        QPainter pp(&iconPixmap);
++        pp.drawPixmap(0, 0, overlayPixmap);
++        pp.end();
++
++        setIconByPixmap(iconPixmap);
+     } else {
+-        setIconByName(QStringLiteral("mail-mark-unread-new"));
++        setIconByPixmap(mIcon);
+     }
+ }
+ 
+Nur in kmail-20.08.3-patched/src: kmsystemtray.cpp.orig.
+diff -rup kmail-20.08.3/src/kmsystemtray.h kmail-20.08.3-patched/src/kmsystemtray.h
+--- kmail-20.08.3/src/kmsystemtray.h	2020-10-31 18:35:07.000000000 +0100
++++ kmail-20.08.3-patched/src/kmsystemtray.h	2021-12-10 04:34:41.427284828 +0100
+@@ -41,8 +41,8 @@ public:
+     /** destructor */
+     ~KMSystemTray();
+ 
++    void setShowUnreadCount(bool showUnreadCount);
+     void hideKMail();
+-
+     void updateStatus(int count);
+     void updateCount(int count);
+     void setUnityServiceManager(KMail::UnityServiceManager *unityServiceManager);
+@@ -53,6 +53,8 @@ private:
+     void slotActivated();
+     void slotContextMenuAboutToShow();
+     void slotSelectCollection(QAction *act);
++    void slotGeneralPaletteChanged();
++    void slotGeneralFontChanged();
+ 
+     Q_REQUIRED_RESULT bool mainWindowIsOnCurrentDesktop();
+     Q_REQUIRED_RESULT bool buildPopupMenu();
+@@ -63,6 +65,10 @@ private:
+     bool mHasUnreadMessage = false;
+     bool mIconNotificationsEnabled = true;
+ 
++    QColor mTextColor;
++    QIcon mIcon;
++    bool mShowUnreadMailCount = true;
++
+     QMenu *mNewMessagesPopup = nullptr;
+     QAction *mSendQueued = nullptr;
+     KMail::UnityServiceManager *mUnityServiceManager = nullptr;
+Nur in kmail-20.08.3-patched/src: kmsystemtray.h.orig.
+diff -rup kmail-20.08.3/src/settings/kmail.kcfg.cmake kmail-20.08.3-patched/src/settings/kmail.kcfg.cmake
+--- kmail-20.08.3/src/settings/kmail.kcfg.cmake	2020-10-31 18:35:07.000000000 +0100
++++ kmail-20.08.3-patched/src/settings/kmail.kcfg.cmake	2021-12-10 04:34:41.427284828 +0100
+@@ -84,6 +84,10 @@
+         <label>Enable system tray icon</label>
+         <default>false</default>
+       </entry>
++      <entry name="SystemTrayShowUnread" type="Bool">
++        <label>Show unread mail in system tray</label>
++        <default>true</default>
++      </entry>
+       <entry name="StartInTray" type="Bool">
+         <label>Start minimized to tray</label>
+         <default>false</default>
+Nur in kmail-20.08.3-patched/src/settings: kmail.kcfg.cmake.orig.
+diff -rup kmail-20.08.3/src/unityservicemanager.cpp kmail-20.08.3-patched/src/unityservicemanager.cpp
+--- kmail-20.08.3/src/unityservicemanager.cpp	2020-10-31 18:35:07.000000000 +0100
++++ kmail-20.08.3-patched/src/unityservicemanager.cpp	2021-12-10 04:34:41.427284828 +0100
+@@ -247,5 +247,8 @@ void UnityServiceManager::toggleSystemTr
+             delete mSystemTray;
+             mSystemTray = nullptr;
+         }
++	if (mSystemTray) {
++            mSystemTray->setShowUnreadCount(KMailSettings::self()->systemTrayShowUnread());
++	}
+     }
+ }
+Nur in kmail-20.08.3-patched/src: unityservicemanager.cpp.orig.
